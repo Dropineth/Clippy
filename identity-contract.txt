@@ -1,0 +1,164 @@
+module cillppy::identity {
+    use std::string::{Self, String};
+    use std::signer;
+    use std::vector;
+    use aptos_framework::account;
+    use aptos_framework::event::{Self, EventHandle};
+    use aptos_std::table::{Self, Table};
+    
+    // Error codes
+    const ERROR_NOT_AUTHORIZED: u64 = 1;
+    const ERROR_IDENTITY_ALREADY_EXISTS: u64 = 2;
+    const ERROR_IDENTITY_DOES_NOT_EXIST: u64 = 3;
+    
+    // Identity struct to store user identity information
+    struct Identity has store, drop, copy {
+        name: String,
+        data_ref: String,
+        created_at: u64,
+        updated_at: u64
+    }
+    
+    // Event emitted when a new identity is registered
+    struct IdentityRegisteredEvent has drop, store {
+        address: address,
+        name: String,
+        data_ref: String,
+        timestamp: u64
+    }
+    
+    // Event emitted when an identity is updated
+    struct IdentityUpdatedEvent has drop, store {
+        address: address,
+        name: String,
+        data_ref: String,
+        timestamp: u64
+    }
+    
+    // Resource struct to store all identities and events
+    struct IdentityStore has key {
+        identities: Table<address, Identity>,
+        register_events: EventHandle<IdentityRegisteredEvent>,
+        update_events: EventHandle<IdentityUpdatedEvent>
+    }
+    
+    // Initialize the module
+    fun init_module(account: &signer) {
+        let identities = table::new<address, Identity>();
+        
+        move_to(account, IdentityStore {
+            identities,
+            register_events: account::new_event_handle<IdentityRegisteredEvent>(account),
+            update_events: account::new_event_handle<IdentityUpdatedEvent>(account)
+        });
+    }
+    
+    // Register a new identity
+    public entry fun register_identity(
+        admin: &signer,
+        user_address: address,
+        name: String,
+        data_ref: String
+    ) acquires IdentityStore {
+        let admin_address = signer::address_of(admin);
+        
+        // Check that the caller is the admin
+        assert!(admin_address == @cillppy, ERROR_NOT_AUTHORIZED);
+        
+        let identity_store = borrow_global_mut<IdentityStore>(@cillppy);
+        
+        // Check that the identity doesn't already exist
+        assert!(!table::contains(&identity_store.identities, user_address), ERROR_IDENTITY_ALREADY_EXISTS);
+        
+        // Get the current timestamp
+        let now = aptos_framework::timestamp::now_seconds();
+        
+        // Create the identity
+        let identity = Identity {
+            name,
+            data_ref,
+            created_at: now,
+            updated_at: now
+        };
+        
+        // Add the identity to the table
+        table::add(&mut identity_store.identities, user_address, identity);
+        
+        // Emit register event
+        event::emit_event(
+            &mut identity_store.register_events,
+            IdentityRegisteredEvent {
+                address: user_address,
+                name,
+                data_ref,
+                timestamp: now
+            }
+        );
+    }
+    
+    // Update an existing identity
+    public entry fun update_identity(
+        admin: &signer,
+        user_address: address,
+        name: String,
+        data_ref: String
+    ) acquires IdentityStore {
+        let admin_address = signer::address_of(admin);
+        
+        // Check that the caller is the admin
+        assert!(admin_address == @cillppy, ERROR_NOT_AUTHORIZED);
+        
+        let identity_store = borrow_global_mut<IdentityStore>(@cillppy);
+        
+        // Check that the identity exists
+        assert!(table::contains(&identity_store.identities, user_address), ERROR_IDENTITY_DOES_NOT_EXIST);
+        
+        // Get the current timestamp
+        let now = aptos_framework::timestamp::now_seconds();
+        
+        // Create updated identity
+        let identity = Identity {
+            name,
+            data_ref,
+            created_at: table::borrow(&identity_store.identities, user_address).created_at,
+            updated_at: now
+        };
+        
+        // Update the identity in the table
+        table::upsert(&mut identity_store.identities, user_address, identity);
+        
+        // Emit update event
+        event::emit_event(
+            &mut identity_store.update_events,
+            IdentityUpdatedEvent {
+                address: user_address,
+                name,
+                data_ref,
+                timestamp: now
+            }
+        );
+    }
+    
+    // Check if an identity exists
+    public fun identity_exists(user_address: address): bool acquires IdentityStore {
+        let identity_store = borrow_global<IdentityStore>(@cillppy);
+        table::contains(&identity_store.identities, user_address)
+    }
+    
+    // Get identity information (view function)
+    public fun get_identity(user_address: address): (String, String, u64, u64) acquires IdentityStore {
+        let identity_store = borrow_global<IdentityStore>(@cillppy);
+        
+        // Check that the identity exists
+        assert!(table::contains(&identity_store.identities, user_address), ERROR_IDENTITY_DOES_NOT_EXIST);
+        
+        let identity = table::borrow(&identity_store.identities, user_address);
+        
+        (
+            identity.name,
+            identity.data_ref,
+            identity.created_at,
+            identity.updated_at
+        )
+    }
+}
