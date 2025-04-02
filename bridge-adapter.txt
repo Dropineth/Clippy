@@ -1,0 +1,399 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.19;
+
+import "@openzeppelin/contracts/access/AccessControl.sol";
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/security/Pausable.sol";
+
+// Interface for the Life++ Token
+interface ILifePlusPlusToken {
+    function transferFrom(address sender, address recipient, uint256 amount) external returns (bool);
+    function receiveFromBridge(address to, uint256 amount, uint256 sourceChainId) external returns (bool);
+}
+
+// Interface for the Life++ NFT
+interface ILifePlusPlusNFT {
+    function ownerOf(uint256 tokenId) external view returns (address);
+    function tokenURI(uint256 tokenId) external view returns (string memory);
+    function transferFrom(address from, address to, uint256 tokenId) external;
+    function receiveFromBridge(address to, uint256 sourceTokenId, uint256 sourceChainId, string memory tokenURI) external returns (uint256);
+    function releaseToken(address to, uint256 tokenId) external;
+}
+
+// Interface for Wormhole Bridge
+interface IWormholeBridge {
+    function publishMessage(
+        uint32 nonce,
+        bytes memory payload,
+        uint8 consistencyLevel
+    ) external payable returns (uint64 sequence);
+    
+    function parseAndVerifyVM(bytes memory encodedVM) 
+        external 
+        view 
+        returns (
+            IWormholeBridge.VM memory vm,
+            bool valid,
+            string memory reason
+        );
+    
+    struct VM {
+        uint8 version;
+        uint32 timestamp;
+        uint32 nonce;
+        uint16 emitterChainId;
+        bytes32 emitterAddress;
+        uint64 sequence;
+        uint8 consistencyLevel;
+        bytes payload;
+        uint32 guardianSetIndex;
+        bytes signatures;
+    }
+}
+
+/**
+ * @title Life++ Wormhole Bridge Adapter
+ * @dev Adapter for connecting Life++ tokens and NFTs to the Wormhole cross-chain protocol
+ */
+contract LifePlusPlusBridgeAdapter is AccessControl, ReentrancyGuard, Pausable {
+    bytes32 public constant RELAYER_ROLE = keccak256("RELAYER_ROLE");
+    
+    // Contracts
+    address public tokenContract;
+    address public nftContract;
+    address public wormholeBridge;
+    
+    // Chain mapping
+    mapping(uint16 => uint256) public wormholeChainToEvmChain;
+    mapping(uint256 => uint16) public evmChainToWormholeChain;
+    
+    // Security parameters
+    uint8 public consistencyLevel = 15; // Wormhole finality requirement
+    
+    // Message type identifiers
+    uint8 private constant TOKEN_TRANSFER = 1;
+    uint8 private constant NFT_TRANSFER = 2;
+    
+    // Events
+    event TokensLocked(address indexed sender, uint256 amount, uint256 targetChainId, bytes recipient);
+    event TokensReleased(address indexed recipient, uint256 amount, uint256 sourceChainId);
+    event NFTLocked(address indexed sender, uint256 tokenId, uint256 targetChainId, bytes recipient);
+    event NFTReleased(address indexed recipient, uint256 tokenId, uint256 sourceChainId);
+    event WormholeMessagePublished(uint256 targetChainId, uint64 sequence);
+    event BridgeContractsUpdated(address tokenContract, address nftContract, address wormholeBridge);
+    event ChainMappingUpdated(uint16 wormholeChainId, uint256 evmChainId);
+    
+    /**
+     * @dev Constructor initializes the bridge adapter
+     * @param _admin Admin address
+     */
+    constructor(address _admin) {
+        _grantRole(DEFAULT_ADMIN_ROLE, _admin);
+        _grantRole(RELAYER_ROLE, _admin);
+    }
+    
+    /**
+     * @dev Set contract addresses
+     * @param _tokenContract Life++ Token contract address
+     * @param _nftContract Life++ NFT contract address
+     * @param _wormholeBridge Wormhole Bridge contract address
+     */
+    function setContracts(address _tokenContract, address _nftContract, address _wormholeBridge) 
+        external 
+        onlyRole(DEFAULT_ADMIN_ROLE) 
+    {
+        require(_tokenContract != address(0), "Invalid token contract");
+        require(_nftContract != address(0), "Invalid NFT contract");
+        require(_wormholeBridge != address(0), "Invalid bridge contract");
+        
+        tokenContract = _tokenContract;
+        nftContract = _nftContract;
+        wormholeBridge = _wormholeBridge;
+        
+        emit BridgeContractsUpdated(_tokenContract, _nftContract, _wormholeBridge);
+    }
+    
+    /**
+     * @dev Set chain mapping
+     * @param _wormholeChainId Wormhole chain ID
+     * @param _evmChainId EVM chain ID
+     */
+    function setChainMapping(uint16 _wormholeChainId, uint256 _evmChainId) 
+        external 
+        onlyRole(DEFAULT_ADMIN_ROLE) 
+    {
+        require(_evmChainId > 0, "Invalid EVM chain ID");
+        
+        wormholeChainToEvmChain[_wormholeChainId] = _evmChainId;
+        evmChainToWormholeChain[_evmChainId] = _wormholeChainId;
+        
+        emit ChainMappingUpdated(_wormholeChainId, _evmChainId);
+    }
+    
+    /**
+     * @dev Set consistency level for Wormhole messages
+     * @param _consistencyLevel New consistency level
+     */
+    function setConsistencyLevel(uint8 _consistencyLevel) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        consistencyLevel = _consistencyLevel;
+    }
+    
+    /**
+     * @dev Pause the bridge
+     */
+    function pause() external onlyRole(DEFAULT_ADMIN_ROLE) {
+        _pause();
+    }
+    
+    /**
+     * @dev Unpause the bridge
+     */
+    function unpause() external onlyRole(DEFAULT_ADMIN_ROLE) {
+        _unpause();
+    }
+    
+    /**
+     * @dev Lock tokens for cross-chain transfer
+     * @param amount Amount to transfer
+     * @param targetChainId Target chain identifier
+     * @param recipient Recipient address on target chain
+     * @return sequence Wormhole message sequence number
+     */
+    function lockTokens(uint256 amount, uint256 targetChainId, bytes calldata recipient) 
+        external 
+        payable
+        nonReentrant
+        whenNotPaused
+        returns (uint64 sequence) 
+    {
+        require(targetChainId != block.chainid, "Cannot transfer to same chain");
+        require(recipient.length > 0, "Invalid recipient");
+        require(tokenContract != address(0), "Token contract not set");
+        require(wormholeBridge != address(0), "Bridge not set");
+        require(evmChainToWormholeChain[targetChainId] != 0, "Unsupported target chain");
+        
+        // Transfer tokens from sender to this contract
+        require(
+            ILifePlusPlusToken(tokenContract).transferFrom(msg.sender, address(this), amount),
+            "Token transfer failed"
+        );
+        
+        // Create payload for Wormhole message
+        bytes memory payload = abi.encode(
+            TOKEN_TRANSFER,
+            msg.sender,
+            amount,
+            recipient
+        );
+        
+        // Publish message to Wormhole
+        uint16 targetWormholeChainId = evmChainToWormholeChain[targetChainId];
+        sequence = IWormholeBridge(wormholeBridge).publishMessage{value: msg.value}(
+            0, // nonce
+            payload,
+            consistencyLevel
+        );
+        
+        emit TokensLocked(msg.sender, amount, targetChainId, recipient);
+        emit WormholeMessagePublished(targetChainId, sequence);
+        
+        return sequence;
+    }
+    
+    /**
+     * @dev Lock NFT for cross-chain transfer
+     * @param tokenId NFT token ID to transfer
+     * @param targetChainId Target chain identifier
+     * @param recipient Recipient address on target chain
+     * @return sequence Wormhole message sequence number
+     */
+    function lockNFT(uint256 tokenId, uint256 targetChainId, bytes calldata recipient) 
+        external 
+        payable
+        nonReentrant
+        whenNotPaused
+        returns (uint64 sequence) 
+    {
+        require(targetChainId != block.chainid, "Cannot transfer to same chain");
+        require(recipient.length > 0, "Invalid recipient");
+        require(nftContract != address(0), "NFT contract not set");
+        require(wormholeBridge != address(0), "Bridge not set");
+        require(evmChainToWormholeChain[targetChainId] != 0, "Unsupported target chain");
+        
+        // Get token URI before transfer
+        string memory tokenURI = ILifePlusPlusNFT(nftContract).tokenURI(tokenId);
+        
+        // Transfer NFT from sender to this contract
+        ILifePlusPlusNFT(nftContract).transferFrom(msg.sender, address(this), tokenId);
+        
+        // Create payload for Wormhole message
+        bytes memory payload = abi.encode(
+            NFT_TRANSFER,
+            msg.sender,
+            tokenId,
+            tokenURI,
+            recipient
+        );
+        
+        // Publish message to Wormhole
+        uint16 targetWormholeChainId = evmChainToWormholeChain[targetChainId];
+        sequence = IWormholeBridge(wormholeBridge).publishMessage{value: msg.value}(
+            0, // nonce
+            payload,
+            consistencyLevel
+        );
+        
+        emit NFTLocked(msg.sender, tokenId, targetChainId, recipient);
+        emit WormholeMessagePublished(targetChainId, sequence);
+        
+        return sequence;
+    }
+    
+    /**
+     * @dev Process a verified Wormhole message for token redemption
+     * @param encodedVM Encoded Wormhole VAA message
+     */
+    function processTokenMessage(bytes calldata encodedVM) 
+        external 
+        nonReentrant
+        whenNotPaused
+        onlyRole(RELAYER_ROLE) 
+    {
+        // Parse and verify Wormhole message
+        (IWormholeBridge.VM memory vm, bool valid, string memory reason) = 
+            IWormholeBridge(wormholeBridge).parseAndVerifyVM(encodedVM);
+            
+        require(valid, string(abi.encodePacked("Invalid VAA: ", reason)));
+        
+        // Decode payload
+        (uint8 messageType, address sender, uint256 amount, bytes memory recipient) = 
+            abi.decode(vm.payload, (uint8, address, uint256, bytes));
+        
+        require(messageType == TOKEN_TRANSFER, "Not a token transfer message");
+        
+        // Convert Wormhole chain ID to EVM chain ID
+        uint256 sourceChainId = wormholeChainToEvmChain[vm.emitterChainId];
+        require(sourceChainId > 0, "Unknown source chain");
+        
+        // Convert recipient bytes to address
+        address recipientAddress = bytesToAddress(recipient);
+        
+        // Process token redemption
+        bool success = ILifePlusPlusToken(tokenContract).receiveFromBridge(
+            recipientAddress,
+            amount,
+            sourceChainId
+        );
+        
+        require(success, "Token redemption failed");
+        
+        emit TokensReleased(recipientAddress, amount, sourceChainId);
+    }
+    
+    /**
+     * @dev Process a verified Wormhole message for NFT redemption
+     * @param encodedVM Encoded Wormhole VAA message
+     */
+    function processNFTMessage(bytes calldata encodedVM) 
+        external 
+        nonReentrant
+        whenNotPaused
+        onlyRole(RELAYER_ROLE) 
+    {
+        // Parse and verify Wormhole message
+        (IWormholeBridge.VM memory vm, bool valid, string memory reason) = 
+            IWormholeBridge(wormholeBridge).parseAndVerifyVM(encodedVM);
+            
+        require(valid, string(abi.encodePacked("Invalid VAA: ", reason)));
+        
+        // Decode payload
+        (uint8 messageType, address sender, uint256 tokenId, string memory tokenURI, bytes memory recipient) = 
+            abi.decode(vm.payload, (uint8, address, uint256, string, bytes));
+        
+        require(messageType == NFT_TRANSFER, "Not an NFT transfer message");
+        
+        // Convert Wormhole chain ID to EVM chain ID
+        uint256 sourceChainId = wormholeChainToEvmChain[vm.emitterChainId];
+        require(sourceChainId > 0, "Unknown source chain");
+        
+        // Convert recipient bytes to address
+        address recipientAddress = bytesToAddress(recipient);
+        
+        // Process NFT redemption - either mint a new one or release existing
+        uint256 newTokenId = ILifePlusPlusNFT(nftContract).receiveFromBridge(
+            recipientAddress,
+            tokenId,
+            sourceChainId,
+            tokenURI
+        );
+        
+        emit NFTReleased(recipientAddress, newTokenId, sourceChainId);
+    }
+    
+    /**
+     * @dev Convert bytes to address
+     * @param bs Bytes representing an address
+     * @return addr Converted address
+     */
+    function bytesToAddress(bytes memory bs) internal pure returns (address addr) {
+        require(bs.length == 20, "Invalid address length");
+        assembly {
+            addr := mload(add(bs, 20))
+        }
+    }
+    
+    /**
+     * @dev Emergency withdrawal of ERC20 tokens
+     * @param token Token address
+     * @param to Recipient address
+     * @param amount Amount to withdraw
+     */
+    function emergencyWithdraw(address token, address to, uint256 amount) 
+        external 
+        onlyRole(DEFAULT_ADMIN_ROLE) 
+    {
+        require(to != address(0), "Invalid recipient");
+        
+        // Transfer tokens
+        (bool success, bytes memory data) = token.call(
+            abi.encodeWithSelector(0xa9059cbb, to, amount) // transfer(address,uint256)
+        );
+        
+        require(success && (data.length == 0 || abi.decode(data, (bool))), "Transfer failed");
+    }
+    
+    /**
+     * @dev Emergency withdrawal of an NFT
+     * @param tokenId NFT token ID
+     * @param to Recipient address
+     */
+    function emergencyWithdrawNFT(uint256 tokenId, address to) 
+        external 
+        onlyRole(DEFAULT_ADMIN_ROLE) 
+    {
+        require(to != address(0), "Invalid recipient");
+        
+        // Transfer NFT
+        ILifePlusPlusNFT(nftContract).transferFrom(address(this), to, tokenId);
+    }
+    
+    /**
+     * @dev Receive ETH
+     */
+    receive() external payable {}
+    
+    /**
+     * @dev Withdraw ETH
+     * @param to Recipient address
+     * @param amount Amount to withdraw
+     */
+    function withdrawETH(address payable to, uint256 amount) 
+        external 
+        onlyRole(DEFAULT_ADMIN_ROLE) 
+    {
+        require(to != address(0), "Invalid recipient");
+        require(amount <= address(this).balance, "Insufficient balance");
+        
+        to.transfer(amount);
+    }
+}

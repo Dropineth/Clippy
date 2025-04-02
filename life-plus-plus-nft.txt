@@ -1,0 +1,248 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.19;
+
+import "@openzeppelin/contracts/token/ERC721/ERC721.sol";
+import "@openzeppelin/contracts/token/ERC721/extensions/ERC721Enumerable.sol";
+import "@openzeppelin/contracts/token/ERC721/extensions/ERC721URIStorage.sol";
+import "@openzeppelin/contracts/security/Pausable.sol";
+import "@openzeppelin/contracts/access/AccessControl.sol";
+import "@openzeppelin/contracts/utils/Counters.sol";
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+
+/**
+ * @title Life++ NFT
+ * @dev Implementation of the Life++ NFT with enhanced security and cross-chain capabilities
+ */
+contract LifePlusPlusNFT is ERC721, ERC721Enumerable, ERC721URIStorage, Pausable, AccessControl, ReentrancyGuard {
+    using Counters for Counters.Counter;
+
+    bytes32 public constant MINTER_ROLE = keccak256("MINTER_ROLE");
+    bytes32 public constant PAUSER_ROLE = keccak256("PAUSER_ROLE");
+    bytes32 public constant BRIDGE_ROLE = keccak256("BRIDGE_ROLE");
+    
+    Counters.Counter private _tokenIdCounter;
+    
+    // Cross-chain bridge contract address
+    address public bridgeContract;
+    
+    // Mapping from token ID to its original chain ID
+    mapping(uint256 => uint256) public tokenOriginChain;
+    
+    // Mapping for cross-chain token ID mapping
+    mapping(uint256 => mapping(uint256 => uint256)) public crossChainTokenMapping;
+    
+    // Enhanced security features
+    mapping(uint256 => bytes) public latticeSignatures;
+    mapping(address => bool) public enhancedSecurityEnabled;
+    
+    // Events
+    event BridgeContractUpdated(address indexed oldBridge, address indexed newBridge);
+    event TokenCrossChainTransferred(uint256 indexed tokenId, uint256 indexed targetChainId, bytes recipient);
+    event TokenReceivedFromBridge(uint256 indexed sourceTokenId, uint256 indexed newTokenId, uint256 sourceChainId);
+    event EnhancedSecurityToggled(address indexed user, bool enabled);
+    event LatticeSignatureAdded(uint256 indexed tokenId, bytes signature);
+
+    /**
+     * @dev Constructor initializes the NFT with name, symbol and roles
+     * @param initialAdmin The address to receive admin role
+     */
+    constructor(address initialAdmin) ERC721("Life++ NFT", "LIFE+") {
+        _grantRole(DEFAULT_ADMIN_ROLE, initialAdmin);
+        _grantRole(MINTER_ROLE, initialAdmin);
+        _grantRole(PAUSER_ROLE, initialAdmin);
+    }
+    
+    /**
+     * @dev Updates the bridge contract address
+     * @param newBridgeContract The new bridge contract address
+     */
+    function setBridgeContract(address newBridgeContract) public onlyRole(DEFAULT_ADMIN_ROLE) {
+        require(newBridgeContract != address(0), "Invalid bridge address");
+        address oldBridge = bridgeContract;
+        bridgeContract = newBridgeContract;
+        _grantRole(BRIDGE_ROLE, newBridgeContract);
+        emit BridgeContractUpdated(oldBridge, newBridgeContract);
+    }
+    
+    /**
+     * @dev Toggle enhanced security features for an address
+     * @param enabled Whether to enable or disable enhanced security
+     */
+    function toggleEnhancedSecurity(bool enabled) public {
+        enhancedSecurityEnabled[msg.sender] = enabled;
+        emit EnhancedSecurityToggled(msg.sender, enabled);
+    }
+    
+    /**
+     * @dev Add a lattice-based signature for a token
+     * @param tokenId The token ID
+     * @param signature The lattice-based signature
+     */
+    function addLatticeSignature(uint256 tokenId, bytes memory signature) public onlyRole(MINTER_ROLE) {
+        require(_exists(tokenId), "Token does not exist");
+        require(signature.length > 0, "Invalid signature");
+        
+        latticeSignatures[tokenId] = signature;
+        emit LatticeSignatureAdded(tokenId, signature);
+    }
+    
+    /**
+     * @dev Mint a new NFT
+     * @param to Recipient of the NFT
+     * @param uri Token URI for the metadata
+     * @param latticeSignature Optional lattice-based signature for enhanced security
+     * @return The ID of the newly minted token
+     */
+    function safeMint(address to, string memory uri, bytes memory latticeSignature) 
+        public 
+        onlyRole(MINTER_ROLE) 
+        returns (uint256)
+    {
+        uint256 tokenId = _tokenIdCounter.current();
+        _tokenIdCounter.increment();
+        _safeMint(to, tokenId);
+        _setTokenURI(tokenId, uri);
+        
+        // Set token origin chain (current chain)
+        tokenOriginChain[tokenId] = block.chainid;
+        
+        // Store lattice signature if provided
+        if (latticeSignature.length > 0) {
+            latticeSignatures[tokenId] = latticeSignature;
+            emit LatticeSignatureAdded(tokenId, latticeSignature);
+        }
+        
+        return tokenId;
+    }
+    
+    /**
+     * @dev Initiate cross-chain transfer of an NFT
+     * @param tokenId The token ID to transfer
+     * @param targetChainId Target chain identifier
+     * @param recipient Recipient address on target chain
+     */
+    function transferCrossChain(uint256 tokenId, uint256 targetChainId, bytes memory recipient) 
+        public 
+        nonReentrant
+        whenNotPaused
+    {
+        require(_isApprovedOrOwner(msg.sender, tokenId), "Not approved or owner");
+        require(targetChainId != block.chainid, "Cannot transfer to same chain");
+        require(recipient.length > 0, "Invalid recipient");
+        
+        // Lock the token by transferring to the bridge contract
+        _transfer(msg.sender, bridgeContract, tokenId);
+        
+        emit TokenCrossChainTransferred(tokenId, targetChainId, recipient);
+    }
+    
+    /**
+     * @dev Receive an NFT from another chain
+     * @param to Recipient address
+     * @param sourceTokenId Original token ID on source chain
+     * @param sourceChainId Source chain identifier
+     * @param tokenURI Token URI for the metadata
+     * @return The ID of the newly minted token
+     */
+    function receiveFromBridge(
+        address to, 
+        uint256 sourceTokenId, 
+        uint256 sourceChainId,
+        string memory tokenURI
+    ) 
+        public 
+        onlyRole(BRIDGE_ROLE) 
+        nonReentrant
+        returns (uint256) 
+    {
+        require(to != address(0), "Invalid recipient");
+        
+        // Mint new token or restore locked token
+        uint256 newTokenId = _tokenIdCounter.current();
+        _tokenIdCounter.increment();
+        _safeMint(to, newTokenId);
+        _setTokenURI(newTokenId, tokenURI);
+        
+        // Record cross-chain mapping
+        crossChainTokenMapping[sourceChainId][sourceTokenId] = newTokenId;
+        
+        // Set token origin chain
+        tokenOriginChain[newTokenId] = sourceChainId;
+        
+        emit TokenReceivedFromBridge(sourceTokenId, newTokenId, sourceChainId);
+        
+        return newTokenId;
+    }
+    
+    /**
+     * @dev Release a previously locked token when it returns to its origin chain
+     * @param to Recipient address
+     * @param tokenId Token ID to release
+     */
+    function releaseToken(address to, uint256 tokenId) 
+        public 
+        onlyRole(BRIDGE_ROLE) 
+        nonReentrant
+    {
+        require(to != address(0), "Invalid recipient");
+        require(_exists(tokenId), "Token does not exist");
+        require(ownerOf(tokenId) == bridgeContract, "Token not locked");
+        
+        // Transfer the token from bridge to recipient
+        _transfer(bridgeContract, to, tokenId);
+    }
+    
+    /**
+     * @dev Pauses token transfers
+     */
+    function pause() public onlyRole(PAUSER_ROLE) {
+        _pause();
+    }
+    
+    /**
+     * @dev Unpauses token transfers
+     */
+    function unpause() public onlyRole(PAUSER_ROLE) {
+        _unpause();
+    }
+    
+    // Override required functions
+    function _beforeTokenTransfer(address from, address to, uint256 tokenId, uint256 batchSize)
+        internal
+        whenNotPaused
+        override(ERC721, ERC721Enumerable)
+    {
+        super._beforeTokenTransfer(from, to, tokenId, batchSize);
+        
+        // Additional security checks for enhanced security users
+        if (from != address(0) && enhancedSecurityEnabled[from]) {
+            // Additional verification could be implemented here
+            // For example, verify a signature or apply additional rate limiting
+        }
+    }
+    
+    function _burn(uint256 tokenId) 
+        internal 
+        override(ERC721, ERC721URIStorage) 
+    {
+        super._burn(tokenId);
+    }
+    
+    function tokenURI(uint256 tokenId)
+        public
+        view
+        override(ERC721, ERC721URIStorage)
+        returns (string memory)
+    {
+        return super.tokenURI(tokenId);
+    }
+    
+    function supportsInterface(bytes4 interfaceId)
+        public
+        view
+        override(ERC721, ERC721Enumerable, AccessControl)
+        returns (bool)
+    {
+        return super.supportsInterface(interfaceId);
+    }
+}
