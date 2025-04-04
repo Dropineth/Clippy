@@ -296,11 +296,11 @@ Life++ 项目由以下层级构成，每一层均可独立扩展，同时通过�
 
 | 模块               | 技术与工具                           | 主要功能描述                                     |
 |--------------------|--------------------------------------|--------------------------------------------------|
-| 前端               | React, JavaScript/TypeScript, Aptos SDK, 钱包插件（Petra Wallet） | 用户交互、数据展示、合约调用、NFT 和 Token 操作    |
+| 前端               | Next.js, JavaScript/TypeScript, Aptos SDK, 钱包插件（Petra Wallet） | 用户交互、数据展示、合约调用、NFT 和 Token 操作    |
 | 后端               | Node.js, Express/Koa, RESTful API, WebSocket | 数据归集、业务逻辑处理、跨链交互 API                |
 | 智能合约           | Move 语言, Aptos CLI                  | Robot NFT 铸造、Token 发放、治理与交易              |
 | 区块链网络         | Aptos Testnet/Mainnet, Solana         | 高吞吐、低延迟交易；跨链 Token 流转                  |
-| 隐私链             | Quorum, IPFS, Walrus                  | 数据加密存储、NFT 元数据记录                         |
+| 隐私链             | Quorum, IPFS, Walrus,Aptos Bridge,BPFS            | 数据加密存储、NFT 元数据记录                         |
 | AI 模型            | Python, TensorFlow/PyTorch, 联邦学习框架 | 多模态数据处理、意识提炼、AI 分身生成                |
 | 安全              | Lattice-based 签名、MPC、HE, ZKP       | 数据传输加密、抗量子加密、智能合约安全审查            |
 
